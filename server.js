@@ -114,6 +114,20 @@ app.post('/admin/ban', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// Root route for testing
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'CustomFOG License Server is running',
+        endpoints: {
+            activate: 'POST /activate',
+            generate: 'POST /admin/generate',
+            list: 'GET /admin/list?password=xxx',
+            ban: 'POST /admin/ban'
+        }
+    });
+});
+
 app.listen(PORT, () => {
     console.log(`License server running on port ${PORT}`);
     console.log(`Webhook URL: ${process.env.RENDER_EXTERNAL_URL}/activate`);
