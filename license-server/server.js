@@ -72,9 +72,10 @@ app.post('/activate', (req, res) => {
 app.post('/admin/generate', (req, res) => {
     const { password, activations, note } = req.body;
     
-    if (password !== process.env.ADMIN_PASSWORD) {
-        return res.status(403).json({ error: 'Wrong password' });
-    }
+    // Remove password requirement for now
+    // if (password !== process.env.ADMIN_PASSWORD) {
+    //     return res.status(403).json({ error: 'Wrong password' });
+    // }
     
     const key = generateLicenseKey();
     licenses[key] = {
