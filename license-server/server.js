@@ -73,21 +73,32 @@ app.post('/activate', (req, res) => {
         return res.json({ ok: false, error: 'Invalid key' });
     }
     
+    // Check if key was already used
+    if (license.usedAt) {
+        console.log('Key already used at:', license.usedAt);
+        return res.json({ ok: false, error: 'Key already used' });
+    }
+    
     if (license.activations <= 0) {
+        console.log('No activations left for key:', key);
         return res.json({ ok: false, error: 'No activations left' });
     }
     
     if (license.banned) {
+        console.log('Key is banned:', key);
         return res.json({ ok: false, error: 'Key banned' });
     }
     
-    // Decrease activations and generate token
-    license.activations--;
+    // Mark as used and generate token
     license.usedAt = new Date().toISOString();
+    license.activations = 0; // Set to 0 to prevent reuse
     const token = crypto.randomBytes(32).toString('hex');
     license.token = token;
     
     saveLicenses();
+    
+    console.log('Activation successful for key:', key);
+    console.log('Token generated:', token.substring(0, 16) + '...');
     
     res.json({ 
         ok: true, 
