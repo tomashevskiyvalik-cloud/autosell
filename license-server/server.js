@@ -178,6 +178,41 @@ app.get('/check-keys', (req, res) => {
     });
 });
 
+// Test endpoint for manual key validation
+app.post('/test-activate', (req, res) => {
+    console.log('=== TEST ACTIVATION ===');
+    console.log('Request body:', req.body);
+    console.log('Available keys count:', Object.keys(licenses).length);
+    
+    const { mod, key } = req.body;
+    
+    console.log('Mod:', mod);
+    console.log('Key:', key);
+    console.log('Key length:', key ? key.length : 'undefined');
+    
+    if (!key) {
+        console.log('ERROR: No key provided');
+        return res.json({ ok: false, error: 'No key provided' });
+    }
+    
+    if (mod !== 'customfog') {
+        console.log('ERROR: Unknown mod:', mod);
+        return res.json({ ok: false, error: 'Unknown mod' });
+    }
+    
+    const license = licenses[key];
+    console.log('License found:', !!license);
+    
+    if (!license) {
+        console.log('ERROR: Invalid key');
+        console.log('Available keys:', Object.keys(licenses));
+        return res.json({ ok: false, error: 'Invalid key' });
+    }
+    
+    console.log('SUCCESS: Key valid');
+    return res.json({ ok: true, token: 'test-token-' + Date.now() });
+});
+
 app.listen(PORT, () => {
     console.log(`License server running on port ${PORT}`);
     console.log(`Webhook URL: ${process.env.RENDER_EXTERNAL_URL}/activate`);
