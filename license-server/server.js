@@ -143,12 +143,26 @@ const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => {
     res.json({ 
         message: 'CustomFOG License Server is running',
+        total_keys: Object.keys(licenses).length,
+        available_keys: Object.keys(licenses),
         endpoints: {
             activate: 'POST /activate',
             generate: 'POST /admin/generate',
             list: 'GET /admin/list?password=xxx',
-            ban: 'POST /admin/ban'
+            ban: 'POST /admin/ban',
+            check_keys: 'GET /check-keys'
         }
+    });
+});
+
+// Debug endpoint to check keys
+app.get('/check-keys', (req, res) => {
+    res.json({
+        total_keys: Object.keys(licenses).length,
+        keys: Object.keys(licenses).map(key => ({
+            key: key,
+            ...licenses[key]
+        }))
     });
 });
 
