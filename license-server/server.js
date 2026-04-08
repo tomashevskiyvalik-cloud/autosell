@@ -11,8 +11,17 @@ const DB_FILE = path.join(__dirname, 'licenses.json');
 
 // Load existing licenses
 let licenses = {};
-if (fs.existsSync(DB_FILE)) {
-    licenses = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+try {
+    if (fs.existsSync(DB_FILE)) {
+        const data = fs.readFileSync(DB_FILE, 'utf8');
+        licenses = JSON.parse(data);
+        console.log('Loaded licenses:', Object.keys(licenses).length, 'keys');
+    } else {
+        console.log('No licenses file found, starting empty');
+    }
+} catch (error) {
+    console.error('Error loading licenses:', error);
+    licenses = {};
 }
 
 // Generate license key
@@ -27,7 +36,10 @@ function saveLicenses() {
 
 // Activation endpoint
 app.post('/activate', (req, res) => {
-    console.log('Received activation request:', req.body);
+    console.log('=== ACTIVATION REQUEST ===');
+    console.log('Request body:', req.body);
+    console.log('Available keys:', Object.keys(licenses));
+    
     const { mod, key } = req.body;
     
     console.log('Mod:', mod);
@@ -39,7 +51,10 @@ app.post('/activate', (req, res) => {
     }
     
     const license = licenses[key];
-    console.log('License found:', license);
+    console.log('License found:', !!license);
+    if (license) {
+        console.log('License data:', license);
+    }
     
     if (!license) {
         console.log('Invalid key:', key);
