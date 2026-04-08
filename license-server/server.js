@@ -162,20 +162,23 @@ app.get('/', (req, res) => {
             generate: 'POST /admin/generate',
             list: 'GET /admin/list?password=xxx',
             ban: 'POST /admin/ban',
-            check_keys: 'GET /check-keys'
+            check_keys: 'GET /check-keys',
+            test_activate: 'POST /test-activate'
         }
     });
 });
 
-// Debug endpoint to check keys
+// Simple check-keys endpoint
 app.get('/check-keys', (req, res) => {
-    res.json({
-        total_keys: Object.keys(licenses).length,
-        keys: Object.keys(licenses).map(key => ({
-            key: key,
-            ...licenses[key]
-        }))
-    });
+    try {
+        res.json({
+            total_keys: Object.keys(licenses).length,
+            keys: Object.keys(licenses)
+        });
+    } catch (error) {
+        console.error('Error in /check-keys:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 // Test endpoint for manual key validation
