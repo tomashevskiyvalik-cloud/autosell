@@ -127,6 +127,28 @@ function verifyEnrollProof(nonce, enrollToken, deviceHash, proof) {
     return typeof proof === 'string' && proof === expected;
 }
 
+function licenseExpired(license) {
+    if (!license || license.licenseExpiresAt == null) {
+        return false;
+    }
+    const t = Number(license.licenseExpiresAt);
+    if (!Number.isFinite(t) || t <= 0) {
+        return false;
+    }
+    return Date.now() > t;
+}
+
+function licenseExpiryPayload(license) {
+    if (!license || license.licenseExpiresAt == null) {
+        return {};
+    }
+    const t = Number(license.licenseExpiresAt);
+    if (!Number.isFinite(t) || t <= 0) {
+        return {};
+    }
+    return { license_expires_at: t };
+}
+
 function requireAdmin(req, res, next) {
     const expected = getAdminSecret();
     if (!expected) {
@@ -199,6 +221,10 @@ app.post('/auth/bind', (req, res) => {
     if (license.banned) {
         return res.json({ ok: false, error: 'Key banned' });
     }
+    if (licenseExpired(license)) {
+        audit('bind_license_expired', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'License expired' });
+    }
     if (license.boundDeviceHash && license.boundDeviceHash !== deviceHash) {
         audit('bind_device_mismatch', req, { keyHash: hashForLogs(normalizedKey) });
         return res.json({ ok: false, error: 'Key is bound to another device' });
@@ -220,7 +246,8 @@ app.post('/auth/bind', (req, res) => {
         ok: true,
         activation_token: license.activationToken,
         session_token: session.sessionToken,
-        session_expires_at: session.sessionExpiresAt
+        session_expires_at: session.sessionExpiresAt,
+        ...licenseExpiryPayload(license)
     });
 });
 
@@ -266,6 +293,10 @@ app.post('/auth/enroll', (req, res) => {
     if (license.banned) {
         return res.json({ ok: false, error: 'Key banned' });
     }
+    if (licenseExpired(license)) {
+        audit('enroll_license_expired', req, { keyHash: hashForLogs(matchedKey) });
+        return res.json({ ok: false, error: 'License expired' });
+    }
     if (license.boundDeviceHash && license.boundDeviceHash !== deviceHash) {
         audit('enroll_device_mismatch', req, { keyHash: hashForLogs(matchedKey) });
         return res.json({ ok: false, error: 'Device mismatch' });
@@ -285,7 +316,8 @@ app.post('/auth/enroll', (req, res) => {
         ok: true,
         activation_token: license.activationToken,
         session_token: session.sessionToken,
-        session_expires_at: session.sessionExpiresAt
+        session_expires_at: session.sessionExpiresAt,
+        ...licenseExpiryPayload(license)
     });
 });
 
@@ -314,6 +346,10 @@ app.post('/auth/session', (req, res) => {
     if (license.banned) {
         return res.json({ ok: false, error: 'Key banned' });
     }
+    if (licenseExpired(license)) {
+        audit('session_license_expired', req, { keyHash: hashForLogs(matchedKey) });
+        return res.json({ ok: false, error: 'License expired' });
+    }
     if (license.boundDeviceHash !== deviceHash) {
         audit('session_device_mismatch', req, { keyHash: hashForLogs(matchedKey) });
         return res.json({ ok: false, error: 'Device mismatch' });
@@ -323,7 +359,8 @@ app.post('/auth/session', (req, res) => {
     res.json({
         ok: true,
         session_token: session.sessionToken,
-        session_expires_at: session.sessionExpiresAt
+        session_expires_at: session.sessionExpiresAt,
+        ...licenseExpiryPayload(license)
     });
 });
 
@@ -350,34 +387,68 @@ app.post('/auth/heartbeat', (req, res) => {
         sessions.delete(sessionToken);
         return res.json({ ok: false, error: 'License invalid' });
     }
+    if (licenseExpired(license)) {
+        sessions.delete(sessionToken);
+        audit('heartbeat_license_expired', req, { keyHash: hashForLogs(session.key) });
+        return res.json({ ok: false, error: 'License expired' });
+    }
     session.expiresAt = Date.now() + SESSION_TTL_MS;
     sessions.set(sessionToken, session);
-    res.json({ ok: true, session_expires_at: session.expiresAt });
+    res.json({ ok: true, session_expires_at: session.expiresAt, ...licenseExpiryPayload(license) });
 });
 
 // Admin endpoint to generate keys
 app.post('/admin/generate', requireAdmin, (req, res) => {
-    const { activations, note, allowed_device_hash: allowedDeviceHash } = req.body;
+    const {
+        activations,
+        note,
+        allowed_device_hash: allowedDeviceHash,
+        valid_days: validDays,
+        valid_minutes: validMinutes,
+        license_expires_at: licenseExpiresAtBody
+    } = req.body;
     const key = generateLicenseKey();
     const enrollToken = crypto.randomBytes(24).toString('hex');
+    let licenseExpiresAt = 0;
+    if (licenseExpiresAtBody != null && licenseExpiresAtBody !== '') {
+        const n = Number(licenseExpiresAtBody);
+        if (Number.isFinite(n) && n > 0) {
+            licenseExpiresAt = n;
+        }
+    } else {
+        const minutes = parseInt(validMinutes, 10);
+        if (Number.isFinite(minutes) && minutes > 0) {
+            licenseExpiresAt = Date.now() + minutes * 60 * 1000;
+        } else {
+            const days = parseInt(validDays, 10);
+            if (Number.isFinite(days) && days > 0) {
+                licenseExpiresAt = Date.now() + days * 86400000;
+            }
+        }
+    }
     licenses[key] = {
         activations: parseInt(activations) || 1,
         note: note || '',
         createdAt: new Date().toISOString(),
         banned: false,
         allowedDeviceHash: typeof allowedDeviceHash === 'string' ? allowedDeviceHash.trim() : '',
-        enrollToken
+        enrollToken,
+        licenseExpiresAt: licenseExpiresAt || undefined
     };
 
     saveLicenses();
 
     audit('admin_generate_key', req, { keyHash: hashForLogs(key) });
-    res.json({ 
+    const out = {
         key: key,
         enroll_token: enrollToken,
         activations: licenses[key].activations,
         note: licenses[key].note
-    });
+    };
+    if (licenseExpiresAt > 0) {
+        out.license_expires_at = licenseExpiresAt;
+    }
+    res.json(out);
 });
 
 // Admin endpoint to approve exact device for key (owner-controlled distribution)
