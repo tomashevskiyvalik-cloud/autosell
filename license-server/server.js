@@ -199,14 +199,6 @@ app.post('/auth/bind', (req, res) => {
     if (license.banned) {
         return res.json({ ok: false, error: 'Key banned' });
     }
-    if (!license.allowedDeviceHash) {
-        audit('bind_not_owner_approved', req, { keyHash: hashForLogs(normalizedKey) });
-        return res.json({ ok: false, error: 'Device is not approved by owner' });
-    }
-    if (license.allowedDeviceHash !== deviceHash) {
-        audit('bind_wrong_approved_device', req, { keyHash: hashForLogs(normalizedKey) });
-        return res.json({ ok: false, error: 'Device is not approved by owner' });
-    }
     if (license.boundDeviceHash && license.boundDeviceHash !== deviceHash) {
         audit('bind_device_mismatch', req, { keyHash: hashForLogs(normalizedKey) });
         return res.json({ ok: false, error: 'Key is bound to another device' });
