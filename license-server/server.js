@@ -2,24 +2,42 @@ const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(express.json());
+app.disable('x-powered-by');
+app.use(
+    helmet({
+        contentSecurityPolicy: false
+    })
+);
 
-// Add CORS headers
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
-        res.sendStatus(200);
-    } else {
-        next();
-    }
+const activateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false
 });
+
+const adminLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+app.use('/activate', activateLimiter);
+app.use('/admin', adminLimiter);
 
 // Database file
 const DB_FILE = path.join(__dirname, 'licenses.json');
+const AUDIT_FILE = path.join(__dirname, 'audit.log');
+const CHALLENGE_TTL_MS = 60 * 1000;
+const SESSION_TTL_MS = 10 * 60 * 1000;
+const challenges = new Map();
+const sessions = new Map();
 
 // Load existing licenses
 let licenses = {};
@@ -41,6 +59,89 @@ function generateLicenseKey() {
     return crypto.randomBytes(16).toString('hex').toUpperCase();
 }
 
+function sha256(input) {
+    return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+function hashForLogs(value) {
+    if (!value) return 'none';
+    return sha256(String(value)).slice(0, 16);
+}
+
+function getClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length > 0) {
+        return xff.split(',')[0].trim();
+    }
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function audit(event, req, extra = {}) {
+    const line = JSON.stringify({
+        ts: new Date().toISOString(),
+        event,
+        ip: getClientIp(req),
+        uaHash: hashForLogs(req.headers['user-agent'] || ''),
+        ...extra
+    });
+    try {
+        fs.appendFileSync(AUDIT_FILE, line + '\n');
+    } catch (error) {
+        console.error('Audit log write error:', error.message);
+    }
+}
+
+function getAdminSecret() {
+    const secret = process.env.ADMIN_PASSWORD;
+    return typeof secret === 'string' ? secret.trim() : '';
+}
+
+function cleanupExpiredState() {
+    const now = Date.now();
+    for (const [nonce, item] of challenges.entries()) {
+        if (!item || item.expiresAt <= now) {
+            challenges.delete(nonce);
+        }
+    }
+    for (const [token, item] of sessions.entries()) {
+        if (!item || item.expiresAt <= now) {
+            sessions.delete(token);
+        }
+    }
+}
+
+function issueSession(key, deviceHash) {
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + SESSION_TTL_MS;
+    sessions.set(sessionToken, { key, deviceHash, expiresAt });
+    return { sessionToken, sessionExpiresAt: expiresAt };
+}
+
+function verifyClientProof(nonce, key, deviceHash, proof) {
+    const expected = sha256(`${nonce}:${key}:${deviceHash}`);
+    return typeof proof === 'string' && proof === expected;
+}
+
+function verifyEnrollProof(nonce, enrollToken, deviceHash, proof) {
+    const expected = sha256(`${nonce}:${enrollToken}:${deviceHash}`);
+    return typeof proof === 'string' && proof === expected;
+}
+
+function requireAdmin(req, res, next) {
+    const expected = getAdminSecret();
+    if (!expected) {
+        return res.status(503).json({ error: 'Admin auth is not configured' });
+    }
+
+    const provided = (req.headers['x-admin-token'] || '').toString().trim();
+    if (!provided || provided !== expected) {
+        audit('admin_auth_failed', req);
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    next();
+}
+
 // Save licenses to file
 function saveLicenses() {
     fs.writeFileSync(DB_FILE, JSON.stringify(licenses, null, 2));
@@ -48,114 +149,277 @@ function saveLicenses() {
 
 // Activation endpoint
 app.post('/activate', (req, res) => {
-    console.log('=== ACTIVATION REQUEST ===');
-    console.log('Request body:', req.body);
-    console.log('Available keys:', Object.keys(licenses));
-    
-    const { mod, key } = req.body;
-    
-    console.log('Mod:', mod);
-    console.log('Key:', key);
-    
-    if (mod !== 'customfog') {
-        console.log('Unknown mod:', mod);
-        return res.json({ ok: false, error: 'Unknown mod' });
-    }
-    
-    const license = licenses[key];
-    console.log('License found:', !!license);
-    if (license) {
-        console.log('License data:', license);
-    }
-    
-    if (!license) {
-        console.log('Invalid key:', key);
-        return res.json({ ok: false, error: 'Invalid key' });
-    }
-    
-    // Check if key was already used
-    if (license.usedAt) {
-        console.log('Key already used at:', license.usedAt);
-        return res.json({ ok: false, error: 'Key already used' });
-    }
-    
-    if (license.activations <= 0) {
-        console.log('No activations left for key:', key);
-        return res.json({ ok: false, error: 'No activations left' });
-    }
-    
-    if (license.banned) {
-        console.log('Key is banned:', key);
-        return res.json({ ok: false, error: 'Key banned' });
-    }
-    
-    // Mark as used and generate token
-    license.usedAt = new Date().toISOString();
-    license.activations = 0; // Set to 0 to prevent reuse
-    const token = crypto.randomBytes(32).toString('hex');
-    license.token = token;
-    
-    saveLicenses();
-    
-    console.log('Activation successful for key:', key);
-    console.log('Token generated:', token.substring(0, 16) + '...');
-    
-    res.json({ 
-        ok: true, 
-        token: token 
+    audit('legacy_activate_blocked', req);
+    res.status(410).json({
+        ok: false,
+        error: 'Legacy /activate is disabled. Use /auth/bind flow'
     });
 });
 
+app.post('/auth/challenge', (req, res) => {
+    cleanupExpiredState();
+    const nonce = crypto.randomBytes(24).toString('hex');
+    const expiresAt = Date.now() + CHALLENGE_TTL_MS;
+    challenges.set(nonce, { expiresAt });
+    res.json({ ok: true, nonce, expires_at: expiresAt });
+});
+
+app.post('/auth/bind', (req, res) => {
+    cleanupExpiredState();
+    const { mod, key, device_hash: deviceHash, nonce, proof } = req.body || {};
+
+    if (mod !== 'customfog') {
+        return res.json({ ok: false, error: 'Unknown mod' });
+    }
+    const normalizedKey = typeof key === 'string' ? key.trim().toUpperCase() : '';
+    if (!normalizedKey) {
+        return res.json({ ok: false, error: 'Invalid key' });
+    }
+    if (!deviceHash || typeof deviceHash !== 'string' || deviceHash.length < 16) {
+        return res.json({ ok: false, error: 'Invalid device hash' });
+    }
+    if (!nonce || !challenges.has(nonce)) {
+        return res.json({ ok: false, error: 'Invalid challenge' });
+    }
+    const challenge = challenges.get(nonce);
+    challenges.delete(nonce);
+    if (!challenge || challenge.expiresAt <= Date.now()) {
+        return res.json({ ok: false, error: 'Challenge expired' });
+    }
+    if (!verifyClientProof(nonce, normalizedKey, deviceHash, proof)) {
+        audit('bind_bad_proof', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'Bad proof' });
+    }
+
+    const license = licenses[normalizedKey];
+    if (!license) {
+        audit('bind_invalid_key', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'Invalid key' });
+    }
+    if (license.banned) {
+        return res.json({ ok: false, error: 'Key banned' });
+    }
+    if (!license.allowedDeviceHash) {
+        audit('bind_not_owner_approved', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'Device is not approved by owner' });
+    }
+    if (license.allowedDeviceHash !== deviceHash) {
+        audit('bind_wrong_approved_device', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'Device is not approved by owner' });
+    }
+    if (license.boundDeviceHash && license.boundDeviceHash !== deviceHash) {
+        audit('bind_device_mismatch', req, { keyHash: hashForLogs(normalizedKey) });
+        return res.json({ ok: false, error: 'Key is bound to another device' });
+    }
+    if (!license.boundDeviceHash) {
+        if (license.usedAt || license.activations <= 0) {
+            return res.json({ ok: false, error: 'Key already used' });
+        }
+        license.boundDeviceHash = deviceHash;
+        license.usedAt = new Date().toISOString();
+        license.activations = 0;
+        license.activationToken = crypto.randomBytes(32).toString('hex');
+    }
+
+    const session = issueSession(normalizedKey, deviceHash);
+    saveLicenses();
+    audit('bind_success', req, { keyHash: hashForLogs(normalizedKey) });
+    res.json({
+        ok: true,
+        activation_token: license.activationToken,
+        session_token: session.sessionToken,
+        session_expires_at: session.sessionExpiresAt
+    });
+});
+
+app.post('/auth/enroll', (req, res) => {
+    cleanupExpiredState();
+    const { mod, enroll_token: enrollToken, device_hash: deviceHash, nonce, proof } = req.body || {};
+    if (mod !== 'customfog') {
+        return res.json({ ok: false, error: 'Unknown mod' });
+    }
+    if (!enrollToken || typeof enrollToken !== 'string') {
+        return res.json({ ok: false, error: 'Invalid enroll token' });
+    }
+    if (!deviceHash || typeof deviceHash !== 'string' || deviceHash.length < 16) {
+        return res.json({ ok: false, error: 'Invalid device hash' });
+    }
+    if (!nonce || !challenges.has(nonce)) {
+        return res.json({ ok: false, error: 'Invalid challenge' });
+    }
+    const challenge = challenges.get(nonce);
+    challenges.delete(nonce);
+    if (!challenge || challenge.expiresAt <= Date.now()) {
+        return res.json({ ok: false, error: 'Challenge expired' });
+    }
+    if (!verifyEnrollProof(nonce, enrollToken, deviceHash, proof)) {
+        audit('enroll_bad_proof', req, { enrollHash: hashForLogs(enrollToken) });
+        return res.json({ ok: false, error: 'Bad proof' });
+    }
+
+    let matchedKey = null;
+    let license = null;
+    for (const key of Object.keys(licenses)) {
+        const cand = licenses[key];
+        if (cand && cand.enrollToken === enrollToken) {
+            matchedKey = key;
+            license = cand;
+            break;
+        }
+    }
+    if (!license || !matchedKey) {
+        audit('enroll_invalid_token', req, { enrollHash: hashForLogs(enrollToken) });
+        return res.json({ ok: false, error: 'Invalid enroll token' });
+    }
+    if (license.banned) {
+        return res.json({ ok: false, error: 'Key banned' });
+    }
+    if (license.boundDeviceHash && license.boundDeviceHash !== deviceHash) {
+        audit('enroll_device_mismatch', req, { keyHash: hashForLogs(matchedKey) });
+        return res.json({ ok: false, error: 'Device mismatch' });
+    }
+    if (!license.boundDeviceHash) {
+        license.boundDeviceHash = deviceHash;
+        license.usedAt = new Date().toISOString();
+        license.activations = 0;
+        if (!license.activationToken) {
+            license.activationToken = crypto.randomBytes(32).toString('hex');
+        }
+    }
+    const session = issueSession(matchedKey, deviceHash);
+    saveLicenses();
+    audit('enroll_success', req, { keyHash: hashForLogs(matchedKey) });
+    res.json({
+        ok: true,
+        activation_token: license.activationToken,
+        session_token: session.sessionToken,
+        session_expires_at: session.sessionExpiresAt
+    });
+});
+
+app.post('/auth/session', (req, res) => {
+    cleanupExpiredState();
+    const { mod, activation_token: activationToken, device_hash: deviceHash } = req.body || {};
+    if (mod !== 'customfog') {
+        return res.json({ ok: false, error: 'Unknown mod' });
+    }
+    if (!activationToken || !deviceHash) {
+        return res.json({ ok: false, error: 'Missing auth data' });
+    }
+    let matchedKey = null;
+    let license = null;
+    for (const key of Object.keys(licenses)) {
+        const cand = licenses[key];
+        if (cand && cand.activationToken === activationToken) {
+            matchedKey = key;
+            license = cand;
+            break;
+        }
+    }
+    if (!license || !matchedKey) {
+        return res.json({ ok: false, error: 'Invalid activation token' });
+    }
+    if (license.banned) {
+        return res.json({ ok: false, error: 'Key banned' });
+    }
+    if (license.boundDeviceHash !== deviceHash) {
+        audit('session_device_mismatch', req, { keyHash: hashForLogs(matchedKey) });
+        return res.json({ ok: false, error: 'Device mismatch' });
+    }
+    const session = issueSession(matchedKey, deviceHash);
+    audit('session_issue', req, { keyHash: hashForLogs(matchedKey) });
+    res.json({
+        ok: true,
+        session_token: session.sessionToken,
+        session_expires_at: session.sessionExpiresAt
+    });
+});
+
+app.post('/auth/heartbeat', (req, res) => {
+    cleanupExpiredState();
+    const { mod, session_token: sessionToken, device_hash: deviceHash } = req.body || {};
+    if (mod !== 'customfog') {
+        return res.json({ ok: false, error: 'Unknown mod' });
+    }
+    if (!sessionToken || !deviceHash) {
+        return res.json({ ok: false, error: 'Missing heartbeat data' });
+    }
+    const session = sessions.get(sessionToken);
+    if (!session || session.expiresAt <= Date.now()) {
+        sessions.delete(sessionToken);
+        return res.json({ ok: false, error: 'Session expired' });
+    }
+    if (session.deviceHash !== deviceHash) {
+        sessions.delete(sessionToken);
+        return res.json({ ok: false, error: 'Device mismatch' });
+    }
+    const license = licenses[session.key];
+    if (!license || license.banned || license.boundDeviceHash !== deviceHash) {
+        sessions.delete(sessionToken);
+        return res.json({ ok: false, error: 'License invalid' });
+    }
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    sessions.set(sessionToken, session);
+    res.json({ ok: true, session_expires_at: session.expiresAt });
+});
+
 // Admin endpoint to generate keys
-app.post('/admin/generate', (req, res) => {
-    const { password, activations, note } = req.body;
-    
-    // Remove password requirement for now
-    // if (password !== process.env.ADMIN_PASSWORD) {
-    //     return res.status(403).json({ error: 'Wrong password' });
-    // }
-    
+app.post('/admin/generate', requireAdmin, (req, res) => {
+    const { activations, note, allowed_device_hash: allowedDeviceHash } = req.body;
     const key = generateLicenseKey();
+    const enrollToken = crypto.randomBytes(24).toString('hex');
     licenses[key] = {
         activations: parseInt(activations) || 1,
         note: note || '',
         createdAt: new Date().toISOString(),
-        banned: false
+        banned: false,
+        allowedDeviceHash: typeof allowedDeviceHash === 'string' ? allowedDeviceHash.trim() : '',
+        enrollToken
     };
-    
+
     saveLicenses();
-    
+
+    audit('admin_generate_key', req, { keyHash: hashForLogs(key) });
     res.json({ 
         key: key,
+        enroll_token: enrollToken,
         activations: licenses[key].activations,
         note: licenses[key].note
     });
 });
 
-// Admin endpoint to list keys
-app.get('/admin/list', (req, res) => {
-    const { password } = req.query;
-    
-    if (password !== process.env.ADMIN_PASSWORD) {
-        return res.status(403).json({ error: 'Wrong password' });
+// Admin endpoint to approve exact device for key (owner-controlled distribution)
+app.post('/admin/allow-device', requireAdmin, (req, res) => {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim().toUpperCase() : '';
+    const deviceHash = typeof req.body?.device_hash === 'string' ? req.body.device_hash.trim() : '';
+    if (!key || !deviceHash) {
+        return res.status(400).json({ error: 'key and device_hash are required' });
     }
-    
+    if (!licenses[key]) {
+        return res.status(404).json({ error: 'Key not found' });
+    }
+    licenses[key].allowedDeviceHash = deviceHash;
+    saveLicenses();
+    audit('admin_allow_device', req, { keyHash: hashForLogs(key), deviceHash: hashForLogs(deviceHash) });
+    res.json({ success: true, key, device_hash: deviceHash });
+});
+
+// Admin endpoint to list keys
+app.get('/admin/list', requireAdmin, (req, res) => {
+    audit('admin_list_keys', req);
     res.json(licenses);
 });
 
 // Admin endpoint to ban key
-app.post('/admin/ban', (req, res) => {
-    const { password, key } = req.body;
-    
-    if (password !== process.env.ADMIN_PASSWORD) {
-        return res.status(403).json({ error: 'Wrong password' });
-    }
-    
+app.post('/admin/ban', requireAdmin, (req, res) => {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim().toUpperCase() : '';
     if (licenses[key]) {
         licenses[key].banned = true;
         saveLicenses();
+        audit('admin_ban_key', req, { keyHash: hashForLogs(key) });
         res.json({ success: true });
     } else {
+        audit('admin_ban_missing_key', req, { keyHash: hashForLogs(key) });
         res.status(404).json({ error: 'Key not found' });
     }
 });
@@ -166,68 +430,14 @@ const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => {
     res.json({ 
         message: 'CustomFOG License Server is running',
-        total_keys: Object.keys(licenses).length,
-        available_keys: Object.keys(licenses),
-        endpoints: {
-            activate: 'POST /activate',
-            generate: 'POST /admin/generate',
-            list: 'GET /admin/list?password=xxx',
-            ban: 'POST /admin/ban',
-            check_keys: 'GET /check-keys',
-            test_activate: 'POST /test-activate'
-        }
+        status: 'ok'
     });
-});
-
-// Simple check-keys endpoint
-app.get('/check-keys', (req, res) => {
-    try {
-        res.json({
-            total_keys: Object.keys(licenses).length,
-            keys: Object.keys(licenses)
-        });
-    } catch (error) {
-        console.error('Error in /check-keys:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Test endpoint for manual key validation
-app.post('/test-activate', (req, res) => {
-    console.log('=== TEST ACTIVATION ===');
-    console.log('Request body:', req.body);
-    console.log('Available keys count:', Object.keys(licenses).length);
-    
-    const { mod, key } = req.body;
-    
-    console.log('Mod:', mod);
-    console.log('Key:', key);
-    console.log('Key length:', key ? key.length : 'undefined');
-    
-    if (!key) {
-        console.log('ERROR: No key provided');
-        return res.json({ ok: false, error: 'No key provided' });
-    }
-    
-    if (mod !== 'customfog') {
-        console.log('ERROR: Unknown mod:', mod);
-        return res.json({ ok: false, error: 'Unknown mod' });
-    }
-    
-    const license = licenses[key];
-    console.log('License found:', !!license);
-    
-    if (!license) {
-        console.log('ERROR: Invalid key');
-        console.log('Available keys:', Object.keys(licenses));
-        return res.json({ ok: false, error: 'Invalid key' });
-    }
-    
-    console.log('SUCCESS: Key valid');
-    return res.json({ ok: true, token: 'test-token-' + Date.now() });
 });
 
 app.listen(PORT, () => {
     console.log(`License server running on port ${PORT}`);
-    console.log(`Webhook URL: ${process.env.RENDER_EXTERNAL_URL}/activate`);
+    console.log(`Activation endpoint: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/activate`);
+    if (!getAdminSecret()) {
+        console.warn('WARNING: ADMIN_PASSWORD is not configured. Admin endpoints are disabled.');
+    }
 });
