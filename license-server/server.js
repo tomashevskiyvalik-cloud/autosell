@@ -31,9 +31,9 @@ const adminLimiter = rateLimit({
 app.use('/activate', activateLimiter);
 app.use('/admin', adminLimiter);
 
-// Database file
-const DB_FILE = path.join(__dirname, 'licenses.json');
-const AUDIT_FILE = path.join(__dirname, 'audit.log');
+// Database/audit file paths (can point to persistent disk on hosting)
+const DB_FILE = (process.env.LICENSE_DB_FILE || path.join(__dirname, 'licenses.json')).trim();
+const AUDIT_FILE = (process.env.AUDIT_LOG_FILE || path.join(__dirname, 'audit.log')).trim();
 const CHALLENGE_TTL_MS = 60 * 1000;
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const challenges = new Map();
@@ -85,6 +85,7 @@ function audit(event, req, extra = {}) {
         ...extra
     });
     try {
+        fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true });
         fs.appendFileSync(AUDIT_FILE, line + '\n');
     } catch (error) {
         console.error('Audit log write error:', error.message);
@@ -166,6 +167,7 @@ function requireAdmin(req, res, next) {
 
 // Save licenses to file
 function saveLicenses() {
+    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
     fs.writeFileSync(DB_FILE, JSON.stringify(licenses, null, 2));
 }
 
@@ -500,6 +502,7 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`License server running on port ${PORT}`);
     console.log(`Activation endpoint: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/activate`);
+    console.log(`License DB file: ${DB_FILE}`);
     if (!getAdminSecret()) {
         console.warn('WARNING: ADMIN_PASSWORD is not configured. Admin endpoints are disabled.');
     }
