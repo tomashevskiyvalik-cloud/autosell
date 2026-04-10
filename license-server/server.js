@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 app.use(express.json());
@@ -31,28 +32,20 @@ const adminLimiter = rateLimit({
 app.use('/activate', activateLimiter);
 app.use('/admin', adminLimiter);
 
-// Database/audit file paths (can point to persistent disk on hosting)
+// Storage config: Upstash Redis (preferred on free hosting) or local file fallback
 const DB_FILE = (process.env.LICENSE_DB_FILE || path.join(__dirname, 'licenses.json')).trim();
 const AUDIT_FILE = (process.env.AUDIT_LOG_FILE || path.join(__dirname, 'audit.log')).trim();
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim();
+const REDIS_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const REDIS_KEY = (process.env.LICENSES_REDIS_KEY || 'customfog:licenses').trim();
 const CHALLENGE_TTL_MS = 60 * 1000;
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const challenges = new Map();
 const sessions = new Map();
+const redis = REDIS_URL && REDIS_TOKEN ? new Redis({ url: REDIS_URL, token: REDIS_TOKEN }) : null;
 
-// Load existing licenses
 let licenses = {};
-try {
-    if (fs.existsSync(DB_FILE)) {
-        const data = fs.readFileSync(DB_FILE, 'utf8');
-        licenses = JSON.parse(data);
-        console.log('Loaded licenses:', Object.keys(licenses).length, 'keys');
-    } else {
-        console.log('No licenses file found, starting empty');
-    }
-} catch (error) {
-    console.error('Error loading licenses:', error);
-    licenses = {};
-}
+let storageMode = redis ? 'upstash' : 'file';
 
 // Generate license key
 function generateLicenseKey() {
@@ -165,10 +158,51 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-// Save licenses to file
-function saveLicenses() {
-    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
-    fs.writeFileSync(DB_FILE, JSON.stringify(licenses, null, 2));
+async function loadLicenses() {
+    if (redis) {
+        try {
+            const data = await redis.get(REDIS_KEY);
+            if (data && typeof data === 'object') {
+                licenses = data;
+            } else if (typeof data === 'string' && data.trim().length > 0) {
+                licenses = JSON.parse(data);
+            } else {
+                licenses = {};
+            }
+            console.log('Loaded licenses from Upstash:', Object.keys(licenses).length, 'keys');
+            return;
+        } catch (error) {
+            console.error('Error loading licenses from Upstash, fallback to file:', error.message);
+            storageMode = 'file-fallback';
+        }
+    }
+
+    try {
+        if (fs.existsSync(DB_FILE)) {
+            const data = fs.readFileSync(DB_FILE, 'utf8');
+            licenses = JSON.parse(data);
+            console.log('Loaded licenses from file:', Object.keys(licenses).length, 'keys');
+        } else {
+            console.log('No licenses file found, starting empty');
+            licenses = {};
+        }
+    } catch (error) {
+        console.error('Error loading licenses from file:', error.message);
+        licenses = {};
+    }
+}
+
+async function saveLicenses() {
+    try {
+        if (redis && storageMode === 'upstash') {
+            await redis.set(REDIS_KEY, licenses);
+            return;
+        }
+        fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+        fs.writeFileSync(DB_FILE, JSON.stringify(licenses, null, 2));
+    } catch (error) {
+        console.error('Save licenses error:', error.message);
+    }
 }
 
 // Activation endpoint
@@ -188,7 +222,7 @@ app.post('/auth/challenge', (req, res) => {
     res.json({ ok: true, nonce, expires_at: expiresAt });
 });
 
-app.post('/auth/bind', (req, res) => {
+app.post('/auth/bind', async (req, res) => {
     cleanupExpiredState();
     const { mod, key, device_hash: deviceHash, nonce, proof } = req.body || {};
 
@@ -242,7 +276,7 @@ app.post('/auth/bind', (req, res) => {
     }
 
     const session = issueSession(normalizedKey, deviceHash);
-    saveLicenses();
+    await saveLicenses();
     audit('bind_success', req, { keyHash: hashForLogs(normalizedKey) });
     res.json({
         ok: true,
@@ -253,7 +287,7 @@ app.post('/auth/bind', (req, res) => {
     });
 });
 
-app.post('/auth/enroll', (req, res) => {
+app.post('/auth/enroll', async (req, res) => {
     cleanupExpiredState();
     const { mod, enroll_token: enrollToken, device_hash: deviceHash, nonce, proof } = req.body || {};
     if (mod !== 'customfog') {
@@ -312,7 +346,7 @@ app.post('/auth/enroll', (req, res) => {
         }
     }
     const session = issueSession(matchedKey, deviceHash);
-    saveLicenses();
+    await saveLicenses();
     audit('enroll_success', req, { keyHash: hashForLogs(matchedKey) });
     res.json({
         ok: true,
@@ -400,7 +434,7 @@ app.post('/auth/heartbeat', (req, res) => {
 });
 
 // Admin endpoint to generate keys
-app.post('/admin/generate', requireAdmin, (req, res) => {
+app.post('/admin/generate', requireAdmin, async (req, res) => {
     const {
         activations,
         note,
@@ -438,7 +472,7 @@ app.post('/admin/generate', requireAdmin, (req, res) => {
         licenseExpiresAt: licenseExpiresAt || undefined
     };
 
-    saveLicenses();
+    await saveLicenses();
 
     audit('admin_generate_key', req, { keyHash: hashForLogs(key) });
     const out = {
@@ -454,7 +488,7 @@ app.post('/admin/generate', requireAdmin, (req, res) => {
 });
 
 // Admin endpoint to approve exact device for key (owner-controlled distribution)
-app.post('/admin/allow-device', requireAdmin, (req, res) => {
+app.post('/admin/allow-device', requireAdmin, async (req, res) => {
     const key = typeof req.body?.key === 'string' ? req.body.key.trim().toUpperCase() : '';
     const deviceHash = typeof req.body?.device_hash === 'string' ? req.body.device_hash.trim() : '';
     if (!key || !deviceHash) {
@@ -464,7 +498,7 @@ app.post('/admin/allow-device', requireAdmin, (req, res) => {
         return res.status(404).json({ error: 'Key not found' });
     }
     licenses[key].allowedDeviceHash = deviceHash;
-    saveLicenses();
+    await saveLicenses();
     audit('admin_allow_device', req, { keyHash: hashForLogs(key), deviceHash: hashForLogs(deviceHash) });
     res.json({ success: true, key, device_hash: deviceHash });
 });
@@ -476,11 +510,11 @@ app.get('/admin/list', requireAdmin, (req, res) => {
 });
 
 // Admin endpoint to ban key
-app.post('/admin/ban', requireAdmin, (req, res) => {
+app.post('/admin/ban', requireAdmin, async (req, res) => {
     const key = typeof req.body?.key === 'string' ? req.body.key.trim().toUpperCase() : '';
     if (licenses[key]) {
         licenses[key].banned = true;
-        saveLicenses();
+        await saveLicenses();
         audit('admin_ban_key', req, { keyHash: hashForLogs(key) });
         res.json({ success: true });
     } else {
@@ -499,11 +533,24 @@ app.get('/', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`License server running on port ${PORT}`);
-    console.log(`Activation endpoint: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/activate`);
-    console.log(`License DB file: ${DB_FILE}`);
-    if (!getAdminSecret()) {
-        console.warn('WARNING: ADMIN_PASSWORD is not configured. Admin endpoints are disabled.');
-    }
+async function start() {
+    await loadLicenses();
+    app.listen(PORT, () => {
+        console.log(`License server running on port ${PORT}`);
+        console.log(`Activation endpoint: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/activate`);
+        console.log(`Storage mode: ${storageMode}`);
+        if (storageMode !== 'upstash') {
+            console.log(`License DB file: ${DB_FILE}`);
+        } else {
+            console.log(`Licenses redis key: ${REDIS_KEY}`);
+        }
+        if (!getAdminSecret()) {
+            console.warn('WARNING: ADMIN_PASSWORD is not configured. Admin endpoints are disabled.');
+        }
+    });
+}
+
+start().catch((error) => {
+    console.error('Failed to start server:', error);
+    process.exit(1);
 });
