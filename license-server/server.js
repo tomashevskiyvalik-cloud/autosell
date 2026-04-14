@@ -40,6 +40,8 @@ const REDIS_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
 const REDIS_KEY = (process.env.LICENSES_REDIS_KEY || 'customfog:licenses').trim();
 const CHALLENGE_TTL_MS = 60 * 1000;
 const SESSION_TTL_MS = 10 * 60 * 1000;
+/** Если в POST /admin/generate не указан срок — ключ на N дней (0 = выключить, только явные valid_days/minutes/expires) */
+const DEFAULT_LICENSE_VALID_DAYS = Math.max(0, parseInt(process.env.DEFAULT_LICENSE_VALID_DAYS || '23', 10) || 0);
 const challenges = new Map();
 const sessions = new Map();
 const redis = REDIS_URL && REDIS_TOKEN ? new Redis({ url: REDIS_URL, token: REDIS_TOKEN }) : null;
@@ -446,6 +448,11 @@ app.post('/admin/generate', requireAdmin, async (req, res) => {
     const key = generateLicenseKey();
     const enrollToken = crypto.randomBytes(24).toString('hex');
     let licenseExpiresAt = 0;
+    const body = req.body || {};
+    const explicitExpiry =
+        (licenseExpiresAtBody != null && licenseExpiresAtBody !== '') ||
+        Object.prototype.hasOwnProperty.call(body, 'valid_minutes') ||
+        Object.prototype.hasOwnProperty.call(body, 'valid_days');
     if (licenseExpiresAtBody != null && licenseExpiresAtBody !== '') {
         const n = Number(licenseExpiresAtBody);
         if (Number.isFinite(n) && n > 0) {
@@ -459,6 +466,8 @@ app.post('/admin/generate', requireAdmin, async (req, res) => {
             const days = parseInt(validDays, 10);
             if (Number.isFinite(days) && days > 0) {
                 licenseExpiresAt = Date.now() + days * 86400000;
+            } else if (!explicitExpiry && DEFAULT_LICENSE_VALID_DAYS > 0) {
+                licenseExpiresAt = Date.now() + DEFAULT_LICENSE_VALID_DAYS * 86400000;
             }
         }
     }
